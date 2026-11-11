@@ -161,21 +161,20 @@ def chunked_loss(model, batch, lengths, chunk_size):
     body, owner, head = _output_layer(model)
     hidden = body(inputs)
 
-    def chunk_ce(params, hidden, targets, mask):
+    def chunk_ce(targets, mask, params, hidden):
         owner.update(params)
         ce = nn.losses.cross_entropy(head(hidden), targets) * mask
         return ce.astype(mx.float32).sum()
 
-    chunk_ce = mx.checkpoint(chunk_ce)
     total = mx.array(0.0)
     for start in range(0, targets.shape[1], chunk_size):
         end = start + chunk_size
-        total = total + chunk_ce(
-            owner.trainable_parameters(),
-            hidden[:, start:end],
-            targets[:, start:end],
-            mask[:, start:end],
+        # Targets and mask are bound rather than passed, since checkpoint
+        # differentiates with respect to every argument it is given.
+        chunk = mx.checkpoint(
+            partial(chunk_ce, targets[:, start:end], mask[:, start:end])
         )
+        total = total + chunk(owner.trainable_parameters(), hidden[:, start:end])
     ntoks = mask.sum()
     return total / ntoks, ntoks
 
