@@ -102,6 +102,20 @@ ignore the prompt and compute loss for just the completion by passing
 datasets. For `chat` datasets the final message in the message list is
 considered the completion. See the [dataset section](#Data) for more details. 
 
+To train on every assistant message in a `chat` example instead of only the
+last, set `train_assistant_messages: all` in the config file (with
+`mask_prompt: true`). An assistant message with `"weight": 0` stays in the
+conversation but gets no loss, as in OpenAI's chat fine-tuning format. Each
+message's tokens are found by rendering the conversation up to it; templates
+that render earlier replies differently from the last one (for example,
+dropping their reasoning) are refused with an error.
+
+#### Long Sequences
+
+Examples longer than `max_seq_length` are cut to fit, with a printed warning.
+Set `truncate_long_sequences: false` in the config file to stop with an error
+before training instead, so no example is silently cut.
+
 ### Evaluate
 
 To compute test set perplexity use:
@@ -392,6 +406,13 @@ of memory. Here are some tips to reduce memory use should you need to do so:
    backward pass. You can use gradient checkpointing by passing the
    `--grad-checkpoint` flag. Gradient checkpointing will be more helpful for
    larger batch sizes or sequence lengths with smaller or quantized models.
+
+6. For long sequences, set `loss_chunk_size` (for example `4096`) in the
+   config file. The output layer and cross entropy then run that many
+   positions at a time, so the logits for every position (sequence length
+   times vocabulary size) never exist at once. It needs a model whose output
+   is its body followed by `lm_head` or tied embeddings; others are refused
+   with an error.
 
 For example, for a machine with 32 GB the following should run reasonably fast:
 
