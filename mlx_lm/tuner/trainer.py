@@ -83,20 +83,130 @@ class TrainingArgs:
     )
 
 
+def loss_mask(lengths, num_targets):
+    """
+    Which target positions count toward the loss, as a [batch, targets]
+    boolean array. ``lengths`` is either that mask already (from datasets that
+    return token spans) or one [offset, length] row per sequence.
+    """
+    if lengths.dtype == mx.bool_:
+        return lengths
+    steps = mx.arange(1, num_targets + 1)
+    return mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+
+
 def default_loss(model, batch, lengths):
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
 
     logits = model(inputs)
 
-    steps = mx.arange(1, targets.shape[1] + 1)
-    mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+    mask = loss_mask(lengths, targets.shape[1])
 
     ce = nn.losses.cross_entropy(logits, targets) * mask
     ntoks = mask.sum()
     ce = ce.astype(mx.float32).sum() / ntoks
 
     return ce, ntoks
+
+
+def _output_layer(model):
+    """
+    The model's body and the module that holds its output layer, with the call
+    that applies it. Supports models with ``model.model`` and either an
+    ``lm_head`` or tied input embeddings.
+    """
+    body = getattr(model, "model", None)
+    if body is None:
+        raise ValueError("loss_chunk_size needs a model with a `model` attribute.")
+    head = getattr(model, "lm_head", None)
+    if head is not None:
+        return body, head, head
+    embed = getattr(body, "embed_tokens", None)
+    if embed is None:
+        raise ValueError(
+            "loss_chunk_size needs a model with `lm_head` or `model.embed_tokens`."
+        )
+    return body, embed, embed.as_linear
+
+
+def check_output_layer(model):
+    """
+    Raise unless the model's body followed by its output layer gives the same
+    logits as the whole model. Models that rescale or cap their logits after
+    the output layer would otherwise be trained on the wrong loss.
+    """
+    body, _, head = _output_layer(model)
+    inputs = mx.array([[0, 1, 2, 3]])
+    whole = model(inputs).astype(mx.float32)
+    split = head(body(inputs)).astype(mx.float32)
+    if not mx.allclose(whole, split, atol=1e-3, rtol=1e-3).item():
+        raise ValueError(
+            "This model changes its logits after the output layer, so "
+            "loss_chunk_size can't be used with it."
+        )
+
+
+def chunked_loss(model, batch, lengths, chunk_size):
+    """
+    The same loss as ``default_loss``, computed with the output layer and
+    cross entropy applied ``chunk_size`` positions at a time under
+    ``mx.checkpoint``, so only one chunk's logits exist at a time. For long
+    sequences the full logits (positions x vocabulary) can take more memory
+    than the model. Check the model first with ``check_output_layer``.
+    """
+    inputs = batch[:, :-1]
+    targets = batch[:, 1:]
+    mask = loss_mask(lengths, targets.shape[1])
+    body, owner, head = _output_layer(model)
+    hidden = body(inputs)
+
+    def chunk_ce(params, hidden, targets, mask):
+        owner.update(params)
+        ce = nn.losses.cross_entropy(head(hidden), targets) * mask
+        return ce.astype(mx.float32).sum()
+
+    chunk_ce = mx.checkpoint(chunk_ce)
+    total = mx.array(0.0)
+    for start in range(0, targets.shape[1], chunk_size):
+        end = start + chunk_size
+        total = total + chunk_ce(
+            owner.trainable_parameters(),
+            hidden[:, start:end],
+            targets[:, start:end],
+            mask[:, start:end],
+        )
+    ntoks = mask.sum()
+    return total / ntoks, ntoks
+
+
+def raise_on_long_examples(dataset, max_seq_length):
+    """
+    Raise if any example is longer than ``max_seq_length``, before training
+    starts rather than when its batch comes up.
+    """
+    lengths = [len(dataset[i][0]) for i in range(len(dataset))]
+    over = [n for n in lengths if n > max_seq_length]
+    if over:
+        raise ValueError(
+            f"{len(over)} of {len(lengths)} examples are longer than "
+            f"max_seq_length={max_seq_length} (the longest has {max(over)} "
+            "tokens). Raise max_seq_length, or set truncate_long_sequences: true "
+            "to cut them."
+        )
+
+
+def _span_mask(spans, lengths, width):
+    """A [batch, width - 1] mask of the target positions inside each sequence's spans."""
+    mask = np.zeros((len(spans), width - 1), dtype=bool)
+    for row, (sequence_spans, length) in enumerate(zip(spans, lengths)):
+        for start, end in sequence_spans:
+            start, end = max(start, 1), min(end, length)
+            if start < end:
+                mask[row, start - 1 : end - 1] = True
+    if not mask.any():
+        raise ValueError("A batch has no tokens to train on.")
+    return mx.array(mask)
 
 
 def iterate_batches(
@@ -106,6 +216,7 @@ def iterate_batches(
     loop=False,
     seed=None,
     comm_group=None,
+    truncate=True,
 ):
     # Sort by length:
     if isinstance(dataset, CacheDataset):
@@ -146,6 +257,11 @@ def iterate_batches(
             else:
                 offsets = [0] * len(batch)
             lengths = [len(x) for x in batch]
+            if max(lengths) > max_seq_length and not truncate:
+                raise ValueError(
+                    f"An example has {max(lengths)} tokens, more than "
+                    f"max_seq_length={max_seq_length}."
+                )
             if max(lengths) > max_seq_length:
                 print(
                     f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
@@ -167,7 +283,10 @@ def iterate_batches(
                     truncated_length  # Update lengths to match truncated lengths
                 )
             batch = mx.array(batch_arr)
-            yield batch, mx.array(list(zip(offsets, lengths)))
+            if isinstance(offsets[0], (list, tuple)):
+                yield batch, _span_mask(offsets, lengths, batch_arr.shape[1])
+            else:
+                yield batch, mx.array(list(zip(offsets, lengths)))
 
         if not loop:
             break

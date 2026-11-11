@@ -3,7 +3,7 @@
 import json
 import types
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from transformers import PreTrainedTokenizer
 
@@ -36,10 +36,48 @@ class TextDataset:
         return len(self._data)
 
 
+def assistant_spans(tokenizer, messages, tools, tokens) -> List[Tuple[int, int]]:
+    """
+    The (start, end) token positions of each assistant message in ``tokens``,
+    the whole conversation as the chat template renders it, skipping messages
+    with ``"weight": 0`` (OpenAI's marker for a message not to train on).
+
+    Each span runs from the end of the generation prompt before the message
+    through the end of the message as the template renders it. Raises if a
+    shorter rendering isn't a prefix of the whole one: some templates render
+    earlier replies differently from the last one (for example, dropping their
+    reasoning), and the span would then mark the wrong tokens.
+    """
+    spans = []
+    for i, message in enumerate(messages):
+        if message.get("role") != "assistant" or message.get("weight", 1) == 0:
+            continue
+        before = tokenizer.apply_chat_template(
+            messages[:i], tools=tools, add_generation_prompt=True, return_dict=False
+        )
+        through = tokenizer.apply_chat_template(
+            messages[: i + 1], tools=tools, return_dict=False
+        )
+        if tokens[: len(before)] != before or tokens[: len(through)] != through:
+            raise ValueError(
+                f"The chat template renders assistant message {i} differently "
+                "inside the whole conversation than at its end, so its tokens "
+                "can't be found; train_assistant_messages: all can't be used "
+                "with this template."
+            )
+        spans.append((len(before), len(through)))
+    return spans
+
+
 class ChatDataset:
     """
     A dataset for chat data in the format of {"messages": [...]}
     https://platform.openai.com/docs/guides/supervised-fine-tuning#formatting-your-data
+
+    With ``mask_prompt``, ``train_assistant_messages="last"`` trains on the
+    final message only. ``"all"`` trains on every assistant message without
+    ``"weight": 0``, and ``process`` returns their token spans in place of a
+    single offset.
     """
 
     def __init__(
@@ -48,10 +86,12 @@ class ChatDataset:
         tokenizer: PreTrainedTokenizer,
         chat_key: str = "messages",
         mask_prompt: bool = False,
+        train_assistant_messages: str = "last",
     ):
         self._data = data
         self.chat_key = chat_key
         self.mask_prompt = mask_prompt
+        self.train_assistant_messages = train_assistant_messages
         self.tokenizer = tokenizer
 
     def process(self, d):
@@ -62,6 +102,8 @@ class ChatDataset:
             tools=tools,
             return_dict=False,
         )
+        if self.mask_prompt and self.train_assistant_messages == "all":
+            return (tokens, assistant_spans(self.tokenizer, messages, tools, tokens))
         if self.mask_prompt:
             add_generation_prompt = messages[-1].get("role") == "assistant"
             offset = len(
@@ -178,6 +220,13 @@ def create_dataset(
     config,
 ):
     mask_prompt = getattr(config, "mask_prompt", False)
+    train_assistant_messages = getattr(config, "train_assistant_messages", "last")
+    if train_assistant_messages not in ("last", "all"):
+        raise ValueError(
+            f"train_assistant_messages must be 'last' or 'all', not {train_assistant_messages!r}."
+        )
+    if train_assistant_messages == "all" and not mask_prompt:
+        raise ValueError("train_assistant_messages: all needs mask_prompt.")
     prompt_feature = getattr(config, "prompt_feature", "prompt")
     text_feature = getattr(config, "text_feature", "text")
     completion_feature = getattr(config, "completion_feature", "completion")
@@ -189,7 +238,11 @@ def create_dataset(
         )
     elif chat_feature in sample:
         return ChatDataset(
-            data, tokenizer, chat_key=chat_feature, mask_prompt=mask_prompt
+            data,
+            tokenizer,
+            chat_key=chat_feature,
+            mask_prompt=mask_prompt,
+            train_assistant_messages=train_assistant_messages,
         )
     elif text_feature in sample:
         if mask_prompt:
@@ -266,6 +319,9 @@ def load_custom_hf_dataset(args, tokenizer: PreTrainedTokenizer):
         ds_path = ds["path"]
         print(f"Loading Hugging Face dataset {ds_path}.")
         ds["mask_prompt"] = getattr(args, "mask_prompt", False)
+        ds["train_assistant_messages"] = getattr(
+            args, "train_assistant_messages", "last"
+        )
         config = types.SimpleNamespace(**ds)
         hf_config = ds.get("config", {})
         if args.train:

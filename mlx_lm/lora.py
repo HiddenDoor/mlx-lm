@@ -4,6 +4,7 @@ import os
 import re
 import types
 import warnings
+from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -14,7 +15,17 @@ import yaml
 
 from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
-from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
+from .tuner.trainer import (
+    TrainingArgs,
+    TrainingCallback,
+    check_output_layer,
+    chunked_loss,
+    default_loss,
+    evaluate,
+    iterate_batches,
+    raise_on_long_examples,
+    train,
+)
 from .tuner.utils import (
     build_schedule,
     linear_to_lora_layers,
@@ -73,6 +84,14 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
+    # "last" trains on the final message; "all" on every assistant message
+    # without "weight": 0 (needs mask_prompt).
+    "train_assistant_messages": "last",
+    # Apply the output layer and cross entropy this many positions at a time,
+    # so long sequences don't need every position's logits at once.
+    "loss_chunk_size": None,
+    # False raises before training if any example is over max_seq_length.
+    "truncate_long_sequences": True,
     "report_to": None,
     "project_name": None,
 }
@@ -213,6 +232,18 @@ def build_parser():
     return parser
 
 
+def loss_and_batches(args, model):
+    """The loss and batch functions the training settings ask for."""
+    batches = partial(
+        iterate_batches, truncate=getattr(args, "truncate_long_sequences", True)
+    )
+    chunk_size = getattr(args, "loss_chunk_size", None)
+    if chunk_size is None:
+        return default_loss, batches
+    check_output_layer(model)
+    return partial(chunked_loss, chunk_size=chunk_size), batches
+
+
 def train_model(
     args,
     model: nn.Module,
@@ -250,6 +281,12 @@ def train_model(
         model.load_weights(args.resume_adapter_file, strict=False)
 
     print_trainable_parameters(model)
+
+    loss, batches = loss_and_batches(args, model)
+    train_set, valid_set = CacheDataset(train_set), CacheDataset(valid_set)
+    if not getattr(args, "truncate_long_sequences", True):
+        raise_on_long_examples(train_set, args.max_seq_length)
+        raise_on_long_examples(valid_set, args.max_seq_length)
 
     adapter_path = Path(args.adapter_path)
     adapter_path.mkdir(parents=True, exist_ok=True)
@@ -296,19 +333,24 @@ def train_model(
         model=model,
         args=training_args,
         optimizer=opt,
-        train_dataset=CacheDataset(train_set),
-        val_dataset=CacheDataset(valid_set),
+        train_dataset=train_set,
+        val_dataset=valid_set,
+        loss=loss,
+        iterate_batches=batches,
         training_callback=training_callback,
     )
 
 
 def evaluate_model(args, model: nn.Module, test_set):
+    loss, batches = loss_and_batches(args, model)
     test_loss = evaluate(
         model=model,
         dataset=CacheDataset(test_set),
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,
+        loss=loss,
+        iterate_batches=batches,
     )
 
     test_ppl = math.exp(test_loss)

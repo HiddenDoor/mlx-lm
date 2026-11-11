@@ -143,5 +143,91 @@ class TestDatasets(unittest.TestCase):
         self.assertEqual(2 * len(test), len(test_double))
 
 
+class TemplateTokenizer:
+    """A stand-in chat template: each message is [role id, one id per character, end id], and the generation prompt
+    is the assistant role id. With `rewrite_history`, earlier assistant messages render empty, as some templates do
+    with earlier reasoning."""
+
+    ROLES = {"system": 1, "user": 2, "assistant": 3, "tool": 4}
+    END = 9
+
+    def __init__(self, rewrite_history=False):
+        self.rewrite_history = rewrite_history
+
+    def content_ids(self, text):
+        return [10 + ord(c) % 50 for c in text]
+
+    def apply_chat_template(
+        self, messages, tools=None, add_generation_prompt=False, return_dict=False
+    ):
+        ids = []
+        for i, m in enumerate(messages):
+            content = self.content_ids(m.get("content") or "")
+            if (
+                self.rewrite_history
+                and m["role"] == "assistant"
+                and i < len(messages) - 1
+            ):
+                content = []
+            ids += [self.ROLES[m["role"]], *content, self.END]
+        if add_generation_prompt:
+            ids.append(self.ROLES["assistant"])
+        return ids
+
+
+def _conversation(first_weight=None):
+    first = {"role": "assistant", "content": "ab"}
+    if first_weight is not None:
+        first["weight"] = first_weight
+    return {
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            first,
+            {"role": "tool", "content": "x"},
+            {"role": "assistant", "content": "cd"},
+        ]
+    }
+
+
+class TestAssistantSpans(unittest.TestCase):
+    def dataset(self, tokenizer, **kwargs):
+        config = types.SimpleNamespace(
+            mask_prompt=True, train_assistant_messages="all", **kwargs
+        )
+        return datasets.create_dataset([_conversation()], tokenizer, config)
+
+    def test_all_assistant_messages_get_spans(self):
+        tok = TemplateTokenizer()
+        ds = self.dataset(tok)
+        tokens, spans = ds.process(_conversation())
+        self.assertEqual(len(spans), 2)
+        for (start, end), text in zip(spans, ["ab", "cd"]):
+            self.assertEqual(tokens[start:end], tok.content_ids(text) + [tok.END])
+
+    def test_weight_zero_message_gets_no_span(self):
+        tok = TemplateTokenizer()
+        tokens, spans = self.dataset(tok).process(_conversation(first_weight=0))
+        self.assertEqual(len(spans), 1)
+        start, end = spans[0]
+        self.assertEqual(tokens[start:end], tok.content_ids("cd") + [tok.END])
+
+    def test_spans_raise_when_template_rewrites_earlier_replies(self):
+        ds = self.dataset(TemplateTokenizer(rewrite_history=True))
+        with self.assertRaises(ValueError):
+            ds.process(_conversation())
+
+    def test_last_mode_still_returns_an_offset(self):
+        config = types.SimpleNamespace(mask_prompt=True)
+        ds = datasets.create_dataset([_conversation()], TemplateTokenizer(), config)
+        tokens, offset = ds.process(_conversation())
+        self.assertIsInstance(offset, int)
+
+    def test_all_mode_needs_mask_prompt(self):
+        config = types.SimpleNamespace(train_assistant_messages="all")
+        with self.assertRaises(ValueError):
+            datasets.create_dataset([_conversation()], TemplateTokenizer(), config)
+
+
 if __name__ == "__main__":
     unittest.main()
