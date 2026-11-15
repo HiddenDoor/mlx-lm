@@ -333,6 +333,7 @@ def train_model(
         grad_checkpoint=args.grad_checkpoint,
         grad_accumulation_steps=args.grad_accumulation_steps,
         clear_cache_threshold=args.clear_cache_threshold,
+        first_token_weight=getattr(args, "first_token_weight", 1.0),
     )
 
     # Initialize the selected optimizer
@@ -383,6 +384,7 @@ def evaluate_model(args, model: nn.Module, test_set):
         max_seq_length=args.max_seq_length,
         loss=loss,
         iterate_batches=batches,
+        first_token_weight=getattr(args, "first_token_weight", 1.0),
         progress_callback=pbar.update if pbar else None,
     )
     if pbar is not None:
