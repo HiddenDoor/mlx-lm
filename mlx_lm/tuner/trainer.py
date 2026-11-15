@@ -81,6 +81,12 @@ class TrainingArgs:
             "help": "Clear the allocator cache between steps if it grows too large."
         },
     )
+    first_token_weight: float = field(
+        default=1.0,
+        metadata={
+            "help": "Weight on each trained message's first token in the loss; validation averages batches by it."
+        },
+    )
 
 
 def loss_mask(lengths, num_targets):
@@ -95,17 +101,54 @@ def loss_mask(lengths, num_targets):
     return mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
 
 
-def default_loss(model, batch, lengths):
+def loss_weights(mask, first_token_weight=1.0):
+    """
+    Each target position's weight in the loss: ``first_token_weight`` on the
+    first trained token of each run of trained positions (each assistant
+    message's first token, or the completion's), 1 on the rest of the mask, 0
+    elsewhere. With the default of 1 it returns ``mask`` itself, so the loss is
+    exactly the unweighted one. Runs never touch, since every message starts
+    after a role header that isn't trained on.
+    """
+    if first_token_weight == 1:
+        return mask
+    before = mx.pad(mask[:, :-1], [(0, 0), (1, 0)], constant_values=False)
+    first = mx.logical_and(mask, mx.logical_not(before))
+    return mx.where(first, first_token_weight, mask.astype(mx.float32))
+
+
+def total_weight(lengths, num_targets, first_token_weight):
+    """
+    What a batch's loss is averaged over: its trained tokens, with each first
+    token counted ``first_token_weight`` times. Averaging batches by this
+    rather than by their token counts gives the weighted mean over the whole
+    set, whichever way the examples are grouped into batches.
+    """
+    return loss_weights(loss_mask(lengths, num_targets), first_token_weight).sum()
+
+
+def _loss_denominator(weights, mask, ntoks):
+    """
+    The loss's denominator. Unweighted, it's the token count, exactly as
+    before: dividing by a second sum of the boolean mask made the compiled
+    training step fail with "unordered_map::at: key not found" (seen with the
+    chunked loss).
+    """
+    return ntoks if weights is mask else weights.sum()
+
+
+def default_loss(model, batch, lengths, first_token_weight=1.0):
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
 
     logits = model(inputs)
 
     mask = loss_mask(lengths, targets.shape[1])
+    weights = loss_weights(mask, first_token_weight)
 
-    ce = nn.losses.cross_entropy(logits, targets) * mask
+    ce = nn.losses.cross_entropy(logits, targets) * weights
     ntoks = mask.sum()
-    ce = ce.astype(mx.float32).sum() / ntoks
+    ce = ce.astype(mx.float32).sum() / _loss_denominator(weights, mask, ntoks)
 
     return ce, ntoks
 
@@ -147,7 +190,7 @@ def check_output_layer(model):
         )
 
 
-def chunked_loss(model, batch, lengths, chunk_size):
+def chunked_loss(model, batch, lengths, chunk_size, first_token_weight=1.0):
     """
     The same loss as ``default_loss``, computed with the output layer and
     cross entropy applied ``chunk_size`` positions at a time under
@@ -158,25 +201,26 @@ def chunked_loss(model, batch, lengths, chunk_size):
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
     mask = loss_mask(lengths, targets.shape[1])
+    weights = loss_weights(mask, first_token_weight)
     body, owner, head = _output_layer(model)
     hidden = body(inputs)
 
-    def chunk_ce(targets, mask, params, hidden):
+    def chunk_ce(targets, weights, params, hidden):
         owner.update(params)
-        ce = nn.losses.cross_entropy(head(hidden), targets) * mask
+        ce = nn.losses.cross_entropy(head(hidden), targets) * weights
         return ce.astype(mx.float32).sum()
 
     total = mx.array(0.0)
     for start in range(0, targets.shape[1], chunk_size):
         end = start + chunk_size
-        # Targets and mask are bound rather than passed, since checkpoint
+        # Targets and weights are bound rather than passed, since checkpoint
         # differentiates with respect to every argument it is given.
         chunk = mx.checkpoint(
-            partial(chunk_ce, targets[:, start:end], mask[:, start:end])
+            partial(chunk_ce, targets[:, start:end], weights[:, start:end])
         )
         total = total + chunk(owner.trainable_parameters(), hidden[:, start:end])
     ntoks = mask.sum()
-    return total / ntoks, ntoks
+    return total / _loss_denominator(weights, mask, ntoks), ntoks
 
 
 def raise_on_long_examples(dataset, max_seq_length):
@@ -300,7 +344,13 @@ def evaluate(
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
     clear_cache_threshold: int = 0,
+    first_token_weight: float = 1.0,
 ):
+    """
+    The mean loss over ``dataset``. With ``first_token_weight`` (the same one
+    ``loss`` uses), each batch counts by its total weight rather than its
+    token count, since that is what its loss is averaged over.
+    """
     model.eval()
     all_losses = mx.array(0.0)
     ntokens = mx.array(0)
@@ -321,6 +371,8 @@ def evaluate(
         total=min(len(dataset) // batch_size, num_batches),
     ):
         losses, toks = loss(model, *batch)
+        if first_token_weight != 1:
+            toks = total_weight(batch[1], batch[0].shape[1] - 1, first_token_weight)
         all_losses += losses * toks
         ntokens += toks
         mx.eval(all_losses, ntokens)
@@ -413,6 +465,7 @@ def train(
                 num_batches=args.val_batches,
                 max_seq_length=args.max_seq_length,
                 iterate_batches=iterate_batches,
+                first_token_weight=args.first_token_weight,
             )
             model.train()
             val_time = time.perf_counter() - tic
