@@ -14,6 +14,7 @@ from mlx_lm.tuner.trainer import (
     check_output_layer,
     chunked_loss,
     default_loss,
+    evaluate,
     iterate_batches,
     loss_mask,
     loss_weights,
@@ -226,6 +227,29 @@ class TestMaskedTraining(unittest.TestCase):
         self.assertNotAlmostEqual(loss.item(), plain.item(), places=3)
         for (name, g), (_, c) in zip(tree_flatten(grads), tree_flatten(c_grads)):
             self.assertTrue(mx.allclose(g, c, atol=1e-4).item(), name)
+
+    def test_weighted_validation_loss_does_not_depend_on_batch_grouping(self):
+        model = tiny_llama()
+        # Four examples with different shares of first tokens among their
+        # trained tokens, so a per-batch average weighted by token count
+        # would differ from the weighted mean over the whole set.
+        data = [
+            (list(range(1, 13)), [(2, 3), (5, 6), (8, 9)]),
+            (list(range(20, 32)), [(2, 11)]),
+            (list(range(32, 42)), [(3, 5), (6, 9)]),
+            (list(range(42, 50)), [(1, 7)]),
+        ]
+        for weight in (1.0, 10.0):
+            loss = lambda m, b, l: default_loss(m, b, l, first_token_weight=weight)
+            by_batch = {
+                size: evaluate(
+                    model, data, size, -1, loss=loss, first_token_weight=weight
+                )
+                for size in (1, 2, 4)
+            }
+            # One batch of all four is the weighted mean over the whole set.
+            self.assertAlmostEqual(by_batch[1], by_batch[4], places=5, msg=weight)
+            self.assertAlmostEqual(by_batch[2], by_batch[4], places=5, msg=weight)
 
     def test_default_path_counts_one_position_past_the_end(self):
         # Records upstream behavior rather than fixing it: with an offset of 0

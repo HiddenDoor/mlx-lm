@@ -81,6 +81,12 @@ class TrainingArgs:
             "help": "Clear the allocator cache between steps if it grows too large."
         },
     )
+    first_token_weight: float = field(
+        default=1.0,
+        metadata={
+            "help": "Weight on each trained message's first token in the loss; validation averages batches by it."
+        },
+    )
 
 
 def loss_mask(lengths, num_targets):
@@ -111,7 +117,17 @@ def loss_weights(mask, first_token_weight=1.0):
     return mx.where(first, first_token_weight, mask.astype(mx.float32))
 
 
-def _total_weight(weights, mask, ntoks):
+def total_weight(lengths, num_targets, first_token_weight):
+    """
+    What a batch's loss is averaged over: its trained tokens, with each first
+    token counted ``first_token_weight`` times. Averaging batches by this
+    rather than by their token counts gives the weighted mean over the whole
+    set, whichever way the examples are grouped into batches.
+    """
+    return loss_weights(loss_mask(lengths, num_targets), first_token_weight).sum()
+
+
+def _loss_denominator(weights, mask, ntoks):
     """
     The loss's denominator. Unweighted, it's the token count, exactly as
     before: dividing by a second sum of the boolean mask made the compiled
@@ -132,7 +148,7 @@ def default_loss(model, batch, lengths, first_token_weight=1.0):
 
     ce = nn.losses.cross_entropy(logits, targets) * weights
     ntoks = mask.sum()
-    ce = ce.astype(mx.float32).sum() / _total_weight(weights, mask, ntoks)
+    ce = ce.astype(mx.float32).sum() / _loss_denominator(weights, mask, ntoks)
 
     return ce, ntoks
 
@@ -204,7 +220,7 @@ def chunked_loss(model, batch, lengths, chunk_size, first_token_weight=1.0):
         )
         total = total + chunk(owner.trainable_parameters(), hidden[:, start:end])
     ntoks = mask.sum()
-    return total / _total_weight(weights, mask, ntoks), ntoks
+    return total / _loss_denominator(weights, mask, ntoks), ntoks
 
 
 def raise_on_long_examples(dataset, max_seq_length):
@@ -328,7 +344,13 @@ def evaluate(
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
     clear_cache_threshold: int = 0,
+    first_token_weight: float = 1.0,
 ):
+    """
+    The mean loss over ``dataset``. With ``first_token_weight`` (the same one
+    ``loss`` uses), each batch counts by its total weight rather than its
+    token count, since that is what its loss is averaged over.
+    """
     model.eval()
     all_losses = mx.array(0.0)
     ntokens = mx.array(0)
@@ -349,6 +371,8 @@ def evaluate(
         total=min(len(dataset) // batch_size, num_batches),
     ):
         losses, toks = loss(model, *batch)
+        if first_token_weight != 1:
+            toks = total_weight(batch[1], batch[0].shape[1] - 1, first_token_weight)
         all_losses += losses * toks
         ntokens += toks
         mx.eval(all_losses, ntokens)
@@ -441,6 +465,7 @@ def train(
                 num_batches=args.val_batches,
                 max_seq_length=args.max_seq_length,
                 iterate_batches=iterate_batches,
+                first_token_weight=args.first_token_weight,
             )
             model.train()
             val_time = time.perf_counter() - tic

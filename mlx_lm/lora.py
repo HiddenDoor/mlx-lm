@@ -316,6 +316,7 @@ def train_model(
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
         grad_accumulation_steps=args.grad_accumulation_steps,
+        first_token_weight=getattr(args, "first_token_weight", 1.0),
     )
 
     # Initialize the selected optimizer
@@ -361,6 +362,7 @@ def evaluate_model(args, model: nn.Module, test_set):
         max_seq_length=args.max_seq_length,
         loss=loss,
         iterate_batches=batches,
+        first_token_weight=getattr(args, "first_token_weight", 1.0),
     )
 
     test_ppl = math.exp(test_loss)
