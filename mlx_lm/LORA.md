@@ -110,6 +110,13 @@ message's tokens are found by rendering the conversation up to it; templates
 that render earlier replies differently from the last one (for example,
 dropping their reasoning) are refused with an error.
 
+To weight the first token of each trained message (or of the completion) more
+heavily, set `first_token_weight` in the config file, for example `10`. The
+loss is then the weighted mean over trained tokens. For a model that calls
+tools, that token is where it decides between calling a tool and writing
+prose, one token among the many it is trained on. The default, `1`, is the
+usual unweighted loss.
+
 #### Long Sequences
 
 Examples longer than `max_seq_length` are cut to fit, with a printed warning.
