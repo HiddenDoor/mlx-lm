@@ -16,6 +16,7 @@ from mlx_lm.tuner.trainer import (
     default_loss,
     iterate_batches,
     loss_mask,
+    loss_weights,
     raise_on_long_examples,
 )
 from mlx_lm.tuner.utils import linear_to_lora_layers
@@ -162,6 +163,70 @@ class TestMaskedTraining(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_output_layer(scaled)
 
+    def test_first_token_weight_of_one_gives_exactly_the_unweighted_loss(self):
+        model = tiny_llama(lora=False)
+        batch, mask = next(iterate_batches(span_batch(), 2, 2048))
+        self.assertIs(loss_weights(mask), mask)
+        ce = nn.losses.cross_entropy(model(batch[:, :-1]), batch[:, 1:]) * mask
+        unweighted = ce.astype(mx.float32).sum() / mask.sum()
+        for loss_fn in (
+            default_loss,
+            lambda m, b, l: default_loss(m, b, l, first_token_weight=1.0),
+            lambda m, b, l: chunked_loss(m, b, l, chunk_size=3, first_token_weight=1),
+        ):
+            loss, ntoks = loss_fn(model, batch, mask)
+            self.assertEqual(ntoks.item(), 8)
+            self.assertAlmostEqual(loss.item(), unweighted.item(), places=6)
+        loss, _ = default_loss(model, batch, mask, first_token_weight=1.0)
+        self.assertEqual(loss.item(), unweighted.item())
+
+    def test_first_token_weight_lands_only_on_each_spans_first_token(self):
+        _, mask = next(iterate_batches(span_batch(), 2, 2048))
+        weights = loss_weights(mask, 10.0)
+        # Column c predicts the token at position c + 1. Batches are sorted by
+        # length, so row 0 is the shorter sequence, with span (3, 6); row 1
+        # has spans (2, 4) and (7, 10).
+        rows = [
+            {
+                c + 1: weights[r, c].item()
+                for c in range(weights.shape[1])
+                if weights[r, c].item()
+            }
+            for r in range(2)
+        ]
+        self.assertEqual(rows[0], {3: 10.0, 4: 1.0, 5: 1.0})
+        self.assertEqual(rows[1], {2: 10.0, 3: 1.0, 7: 10.0, 8: 1.0, 9: 1.0})
+
+    def test_first_token_weight_lands_on_the_completions_first_token(self):
+        weights = loss_weights(loss_mask(mx.array([[2, 5]]), 8), 10.0)
+        self.assertEqual(weights[0].tolist(), [0, 10, 1, 1, 1, 0, 0, 0])
+
+    def test_weighted_loss_is_the_weighted_mean_and_chunking_keeps_it(self):
+        model = tiny_llama()
+        batch, mask = next(iterate_batches(span_batch(), 2, 2048))
+        weights = loss_weights(mask, 10.0)
+        ce = nn.losses.cross_entropy(model(batch[:, :-1]), batch[:, 1:])
+        expected = (ce * weights).sum() / weights.sum()
+        full = nn.value_and_grad(
+            model, lambda m, b, l: default_loss(m, b, l, first_token_weight=10.0)
+        )
+        chunked = nn.value_and_grad(
+            model,
+            lambda m, b, l: chunked_loss(
+                m, b, l, chunk_size=3, first_token_weight=10.0
+            ),
+        )
+        (loss, ntoks), grads = full(model, batch, mask)
+        (c_loss, c_ntoks), c_grads = chunked(model, batch, mask)
+        self.assertEqual(ntoks.item(), 8)
+        self.assertEqual(c_ntoks.item(), 8)
+        self.assertAlmostEqual(loss.item(), expected.item(), places=5)
+        self.assertAlmostEqual(c_loss.item(), expected.item(), places=4)
+        plain, _ = default_loss(model, batch, mask)
+        self.assertNotAlmostEqual(loss.item(), plain.item(), places=3)
+        for (name, g), (_, c) in zip(tree_flatten(grads), tree_flatten(c_grads)):
+            self.assertTrue(mx.allclose(g, c, atol=1e-4).item(), name)
+
     def test_default_path_counts_one_position_past_the_end(self):
         # Records upstream behavior rather than fixing it: with an offset of 0
         # and a length of 3, the mask covers target positions 1, 2 and 3, and
@@ -218,6 +283,33 @@ class TestLoraSettings(unittest.TestCase):
                 args, tiny_llama(lora=False), Processed(span_batch()), Processed()
             )
             self.assertTrue(os.path.exists(os.path.join(tmp, "adapters.safetensors")))
+
+    def test_train_model_trains_with_a_first_token_weight(self):
+        from mlx_lm import lora
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.args(
+                tmp,
+                batch_size=1,
+                num_layers=2,
+                loss_chunk_size=3,
+                first_token_weight=10.0,
+                save_every=1,
+            )
+            lora.train_model(
+                args, tiny_llama(lora=False), Processed(span_batch()), Processed()
+            )
+            self.assertTrue(os.path.exists(os.path.join(tmp, "adapters.safetensors")))
+
+    def test_train_model_refuses_a_first_token_weight_that_isnt_positive(self):
+        from mlx_lm import lora
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.args(tmp, batch_size=1, num_layers=2, first_token_weight=0)
+            with self.assertRaisesRegex(ValueError, "first_token_weight"):
+                lora.train_model(
+                    args, tiny_llama(lora=False), Processed(span_batch()), Processed()
+                )
 
     def test_train_model_with_chunked_loss_checks_the_output_layer(self):
         from mlx_lm import lora

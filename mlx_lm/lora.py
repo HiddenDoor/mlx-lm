@@ -92,6 +92,10 @@ CONFIG_DEFAULTS = {
     "loss_chunk_size": None,
     # False raises before training if any example is over max_seq_length.
     "truncate_long_sequences": True,
+    # Weight on the first trained token of each message (or completion) in
+    # the loss, which is the weighted mean over trained tokens. 1 is the
+    # usual unweighted loss.
+    "first_token_weight": 1.0,
     "report_to": None,
     "project_name": None,
 }
@@ -238,10 +242,16 @@ def loss_and_batches(args, model):
         iterate_batches, truncate=getattr(args, "truncate_long_sequences", True)
     )
     chunk_size = getattr(args, "loss_chunk_size", None)
+    weight = getattr(args, "first_token_weight", 1.0)
+    if weight <= 0:
+        raise ValueError(f"first_token_weight must be positive, not {weight}.")
     if chunk_size is None:
-        return default_loss, batches
+        return partial(default_loss, first_token_weight=weight), batches
     check_output_layer(model)
-    return partial(chunked_loss, chunk_size=chunk_size), batches
+    return (
+        partial(chunked_loss, chunk_size=chunk_size, first_token_weight=weight),
+        batches,
+    )
 
 
 def train_model(
